@@ -359,6 +359,24 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(hold.held).toBe(false);
   });
 
+  it("does not create a long_active_duration review for routine_execution issues", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: new Date(now.getTime() - 4 * 24 * 60 * 60 * 1000),
+      originKind: "routine_execution",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   it("creates a high-churn review even when every sampled run has a progress comment", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue();

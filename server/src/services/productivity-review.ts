@@ -472,7 +472,14 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       : null;
 
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
-    const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
+    // Routine-execution issues stay `in_progress` by design between scheduled
+    // runs (e.g. cron watchdogs), so cumulative active duration is not a useful
+    // health signal for them. Suppress the long_active trigger; no_comment_streak
+    // and high_churn still apply.
+    const longActive =
+      elapsedMs !== null &&
+      elapsedMs >= thresholds.longActiveMs &&
+      sourceIssue.originKind !== "routine_execution";
     const highChurn =
       runCountLastHour >= thresholds.highChurnHourly ||
       assigneeRunCommentCountLastHour >= thresholds.highChurnHourly ||
