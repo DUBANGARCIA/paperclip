@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { and, asc, desc, eq, gt, inArray, isNull, lt, ne, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -28,12 +28,24 @@ import {
   projects,
 } from "@paperclipai/db";
 import type {
+  IssueCommentAuthorType,
+  IssueCommentMetadata,
+  IssueCommentPresentation,
   IssueBlockerAttention,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
 } from "@paperclipai/shared";
-import { clampIssueRequestDepth, extractAgentMentionIds, extractProjectMentionIds, isUuidLike } from "@paperclipai/shared";
+import {
+  clampIssueRequestDepth,
+  extractAgentMentionIds,
+  extractProjectMentionIds,
+  issueCommentAuthorTypeSchema,
+  issueCommentMetadataSchema,
+  issueCommentPresentationSchema,
+  isUuidLike,
+  normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+} from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -121,9 +133,11 @@ export interface IssueFilters {
   descendantOf?: string;
   labelId?: string;
   originKind?: string;
+  originKindPrefix?: string;
   originId?: string;
   includeRoutineExecutions?: boolean;
   excludeRoutineExecutions?: boolean;
+  includePluginOperations?: boolean;
   includeBlockedBy?: boolean;
   q?: string;
   limit?: number;
@@ -141,6 +155,19 @@ type IssueActiveRunRow = {
   startedAt: Date | null;
   finishedAt: Date | null;
   createdAt: Date;
+};
+type IssueScheduledRetryRow = {
+  runId: string;
+  status: "scheduled_retry" | "queued" | "running" | "cancelled";
+  agentId: string;
+  agentName: string | null;
+  retryOfRunId: string | null;
+  scheduledRetryAt: Date | null;
+  scheduledRetryAttempt: number;
+  scheduledRetryReason: string | null;
+  retryExhaustedReason?: string | null;
+  error?: string | null;
+  errorCode?: string | null;
 };
 type IssueWithLabels = IssueRow & { labels: IssueLabelRow[]; labelIds: string[] };
 type IssueWithLabelsAndRun = IssueWithLabels & { activeRun: IssueActiveRunRow | null };
@@ -555,6 +582,19 @@ function inboxVisibleForUserCondition(companyId: string, userId: string) {
         AND ${issueInboxArchives.archivedAt} >= ${issueLastActivityAt}
     )
   `;
+}
+
+function nonPluginOperationIssueCondition() {
+  return sql<boolean>`NOT (${issues.originKind} LIKE 'plugin:%:operation' OR ${issues.originKind} LIKE 'plugin:%:operation:%')`;
+}
+
+function shouldIncludePluginOperationIssues(filters: IssueFilters | undefined) {
+  return Boolean(
+    filters?.includePluginOperations ||
+    filters?.originKind ||
+    filters?.originId ||
+    filters?.projectId,
+  );
 }
 
 /** Named entities commonly emitted in saved issue bodies; unknown `&name;` sequences are left unchanged. */
@@ -1269,6 +1309,9 @@ async function listIssueBlockerAttentionMap(
     if (explicitWaitingIssueIds.has(node.id)) {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
+    if (node.assigneeUserId && node.status !== "cancelled") {
+      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+    }
     if (node.status === "in_review") {
       const hasWaitingPath = activeIssueIds.has(node.id) || Boolean(node.assigneeUserId);
       if (hasWaitingPath) {
@@ -1280,6 +1323,9 @@ async function listIssueBlockerAttentionMap(
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (node.status === "cancelled") {
+      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+    }
+    if (node.status === "backlog" && node.assigneeAgentId) {
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
 
@@ -1403,6 +1449,7 @@ const issueListSelect = {
     END
   `,
   status: issues.status,
+  workMode: issues.workMode,
   priority: issues.priority,
   assigneeAgentId: issues.assigneeAgentId,
   assigneeUserId: issues.assigneeUserId,
@@ -1658,10 +1705,77 @@ export function issueService(db: Db) {
     return enriched;
   }
 
-  function redactIssueComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
+  async function getCurrentScheduledRetryForIssue(issueId: string, companyId: string): Promise<IssueScheduledRetryRow | null> {
+    const row = await db
+      .select({
+        runId: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        agentId: heartbeatRuns.agentId,
+        agentName: agents.name,
+        retryOfRunId: heartbeatRuns.retryOfRunId,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+      })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(asc(heartbeatRuns.scheduledRetryAt), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+
+    return row ? { ...row, status: "scheduled_retry" } : null;
+  }
+
+  function deriveIssueCommentAuthorType(comment: {
+    authorType?: string | null;
+    authorAgentId?: string | null;
+    authorUserId?: string | null;
+  }): IssueCommentAuthorType {
+    const explicit = issueCommentAuthorTypeSchema.safeParse(comment.authorType);
+    if (explicit.success) return explicit.data;
+    if (comment.authorAgentId) return "agent";
+    if (comment.authorUserId) return "user";
+    return "system";
+  }
+
+  function assertIssueCommentAuthorTypeAllowed(
+    actor: { agentId?: string | null; userId?: string | null },
+    authorType: IssueCommentAuthorType,
+  ) {
+    if (actor.agentId && authorType !== "agent") {
+      throw unprocessable("Comment authorType must match authenticated actor");
+    }
+    if (actor.userId && authorType !== "user") {
+      throw unprocessable("Comment authorType must match authenticated actor");
+    }
+    if (!actor.agentId && !actor.userId && authorType !== "system") {
+      throw unprocessable("System comments cannot use user or agent authorType without an author id");
+    }
+  }
+
+  function redactIssueComment<T extends { body: string; authorType?: string | null; authorAgentId?: string | null; authorUserId?: string | null; presentation?: unknown; metadata?: unknown }>(
+    comment: T,
+    censorUsernameInLogs: boolean,
+  ): T & {
+    authorType: IssueCommentAuthorType;
+    presentation: IssueCommentPresentation | null;
+    metadata: IssueCommentMetadata | null;
+  } {
     return {
       ...comment,
+      authorType: deriveIssueCommentAuthorType(comment),
       body: redactCurrentUserText(comment.body, { enabled: censorUsernameInLogs }),
+      presentation: issueCommentPresentationSchema.nullable().catch(null).parse(comment.presentation ?? null),
+      metadata: issueCommentMetadataSchema.nullable().catch(null).parse(comment.metadata ?? null),
     };
   }
 
@@ -2195,7 +2309,11 @@ export function issueService(db: Db) {
       }
       if (filters?.parentId) conditions.push(eq(issues.parentId, filters.parentId));
       if (filters?.originKind) conditions.push(eq(issues.originKind, filters.originKind));
+      if (filters?.originKindPrefix) conditions.push(like(issues.originKind, `${filters.originKindPrefix}%`));
       if (filters?.originId) conditions.push(eq(issues.originId, filters.originId));
+      if (!shouldIncludePluginOperationIssues(filters)) {
+        conditions.push(nonPluginOperationIssueCondition());
+      }
       if (filters?.labelId) {
         const labeledIssueIds = await db
           .select({ issueId: issueLabels.issueId })
@@ -2327,6 +2445,7 @@ export function issueService(db: Db) {
       const conditions = [
         eq(issues.companyId, companyId),
         isNull(issues.hiddenAt),
+        nonPluginOperationIssueCondition(),
         unreadForUserCondition(companyId, userId),
       ];
       if (status) {
@@ -2418,8 +2537,9 @@ export function issueService(db: Db) {
 
     getById: async (raw: string) => {
       const id = raw.trim();
-      if (/^[A-Z]+-\d+$/i.test(id)) {
-        return getIssueByIdentifier(id);
+      const identifier = normalizeIssueReferenceIdentifier(id);
+      if (identifier) {
+        return getIssueByIdentifier(identifier);
       }
       if (!isUuidLike(id)) {
         return null;
@@ -2429,6 +2549,16 @@ export function issueService(db: Db) {
 
     getByIdentifier: async (identifier: string) => {
       return getIssueByIdentifier(identifier);
+    },
+
+    getCurrentScheduledRetry: async (issueId: string) => {
+      const issue = await db
+        .select({ id: issues.id, companyId: issues.companyId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) throw notFound("Issue not found");
+      return getCurrentScheduledRetryForIssue(issue.id, issue.companyId);
     },
 
     getRelationSummaries: async (issueId: string) => {
@@ -3568,6 +3698,100 @@ export function issueService(db: Db) {
         };
       }),
 
+    forceRelease: async (
+      id: string,
+      opts: {
+        actorAgentId?: string | null;
+        actorRunId?: string | null;
+        reason?: string | null;
+        runIdHeld?: string | null;
+        stalenessThresholdMs?: number | null;
+      },
+    ) => {
+      const MIN_STALENESS_MS = 15 * 60 * 1000;
+      const MAX_STALENESS_MS = 24 * 60 * 60 * 1000;
+      const DEFAULT_STALENESS_MS = 60 * 60 * 1000;
+
+      const thresholdMs =
+        opts.stalenessThresholdMs != null
+          ? Math.max(MIN_STALENESS_MS, Math.min(MAX_STALENESS_MS, opts.stalenessThresholdMs))
+          : DEFAULT_STALENESS_MS;
+
+      const existing = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+
+      if (!existing) return null;
+
+      const TERMINAL_STATUSES = new Set(["done", "cancelled"]);
+      if (TERMINAL_STATUSES.has(existing.status)) {
+        throw unprocessable("issue_in_terminal_state");
+      }
+
+      if (!existing.checkoutRunId) {
+        return null;
+      }
+
+      // Check if a live activeRun exists for the checkout run
+      const liveRun = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, existing.checkoutRunId),
+            inArray(heartbeatRuns.status, ACTIVE_RUN_STATUSES),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+
+      if (liveRun) {
+        throw conflict("active_run_present");
+      }
+
+      // Check staleness using executionLockedAt
+      const lockAcquiredAt = existing.executionLockedAt;
+      if (!lockAcquiredAt || Date.now() - lockAcquiredAt.getTime() < thresholdMs) {
+        throw conflict("lock_not_stale");
+      }
+
+      const clearedRunId = existing.checkoutRunId;
+      const newStatus = existing.status === "in_progress" ? "todo" : existing.status;
+
+      const patch: Partial<typeof issues.$inferInsert> = {
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      };
+      if (newStatus !== existing.status) {
+        patch.status = newStatus;
+        patch.assigneeAgentId = null;
+      }
+
+      const updated = await db
+        .update(issues)
+        .set(patch)
+        .where(eq(issues.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) return null;
+      const [enriched] = await withIssueLabels(db, [updated]);
+      return {
+        ...enriched,
+        forceReleased: true as const,
+        clearedRunId,
+        reasonCode: "stale_cross_actor" as const,
+        actorAgentId: opts.actorAgentId ?? null,
+        actorRunId: opts.actorRunId ?? null,
+        reason: opts.reason ?? null,
+        stalenessMs: Date.now() - lockAcquiredAt.getTime(),
+      };
+    },
+
     listLabels: (companyId: string) =>
       db.select().from(labels).where(eq(labels.companyId, companyId)).orderBy(asc(labels.name), asc(labels.id)),
 
@@ -3716,6 +3940,12 @@ export function issueService(db: Db) {
       issueId: string,
       body: string,
       actor: { agentId?: string; userId?: string; runId?: string | null },
+      options?: {
+        authorType?: IssueCommentAuthorType | null;
+        presentation?: IssueCommentPresentation | null;
+        metadata?: IssueCommentMetadata | null;
+        createdAt?: Date | string | null;
+      },
     ) => {
       const issue = await db
         .select({ companyId: issues.companyId })
@@ -3729,6 +3959,13 @@ export function issueService(db: Db) {
         enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
       };
       const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
+      const authorType = issueCommentAuthorTypeSchema.parse(
+        options?.authorType ?? (actor.agentId ? "agent" : actor.userId ? "user" : "system"),
+      );
+      assertIssueCommentAuthorTypeAllowed(actor, authorType);
+      const presentation = issueCommentPresentationSchema.nullable().parse(options?.presentation ?? null);
+      const metadata = issueCommentMetadataSchema.nullable().parse(options?.metadata ?? null);
+      const createdAt = options?.createdAt ? new Date(options.createdAt) : null;
       const [comment] = await db
         .insert(issueComments)
         .values({
@@ -3736,8 +3973,12 @@ export function issueService(db: Db) {
           issueId,
           authorAgentId: actor.agentId ?? null,
           authorUserId: actor.userId ?? null,
+          authorType,
           createdByRunId: actor.runId ?? null,
           body: redactedBody,
+          presentation,
+          metadata,
+          ...(createdAt && !Number.isNaN(createdAt.getTime()) ? { createdAt } : {}),
         })
         .returning();
 
