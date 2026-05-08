@@ -1,11 +1,17 @@
 import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { HttpError } from "../errors.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   forceRelease: vi.fn(),
   addComment: vi.fn(),
+  assertCheckoutOwner: vi.fn(),
+  findMentionedAgents: vi.fn(),
+  listWakeableBlockedDependents: vi.fn(),
+  getWakeableParentAfterChildCompletion: vi.fn(),
+  update: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -15,56 +21,55 @@ const mockAccessService = vi.hoisted(() => ({
 
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 
-function registerModuleMocks() {
-  vi.doMock("@paperclipai/shared/telemetry", () => ({
-    trackAgentTaskCompleted: vi.fn(),
-    trackErrorHandlerCrash: vi.fn(),
-  }));
+vi.mock("@paperclipai/shared/telemetry", () => ({
+  trackAgentTaskCompleted: vi.fn(),
+  trackErrorHandlerCrash: vi.fn(),
+}));
 
-  vi.doMock("../telemetry.js", () => ({
-    getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
-  }));
+vi.mock("../telemetry.js", () => ({
+  getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
+}));
 
-  vi.doMock("../services/index.js", () => ({
-    accessService: () => mockAccessService,
-    agentService: () => ({ getById: vi.fn(async () => null) }),
-    documentService: () => ({}),
-    executionWorkspaceService: () => ({}),
-    feedbackService: () => ({
-      listIssueVotesForUser: vi.fn(async () => []),
-      saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
-    }),
-    goalService: () => ({}),
-    heartbeatService: () => ({
-      wakeup: vi.fn(async () => undefined),
-      reportRunActivity: vi.fn(async () => undefined),
-      getRun: vi.fn(async () => null),
-      getActiveRunForAgent: vi.fn(async () => null),
-      cancelRun: vi.fn(async () => null),
-    }),
-    instanceSettingsService: () => ({
-      get: vi.fn(async () => ({
-        id: "instance-settings-1",
-        general: {
-          censorUsernameInLogs: false,
-          feedbackDataSharingPreference: "prompt",
-        },
-      })),
-      listCompanyIds: vi.fn(async () => ["company-1"]),
-    }),
-    issueApprovalService: () => ({}),
-    issueService: () => mockIssueService,
-    logActivity: mockLogActivity,
-    projectService: () => ({}),
-    routineService: () => ({ syncRunStatusForIssue: vi.fn(async () => undefined) }),
-    workProductService: () => ({}),
-  }));
-}
+vi.mock("../services/index.js", () => ({
+  accessService: () => mockAccessService,
+  agentService: () => ({ getById: vi.fn(async () => null), resolveByReference: vi.fn() }),
+  documentService: () => ({}),
+  executionWorkspaceService: () => ({}),
+  feedbackService: () => ({
+    listIssueVotesForUser: vi.fn(async () => []),
+    saveIssueVote: vi.fn(async () => ({ vote: null, consentEnabledNow: false, sharingEnabled: false })),
+  }),
+  goalService: () => ({}),
+  heartbeatService: () => ({
+    wakeup: vi.fn(async () => undefined),
+    reportRunActivity: vi.fn(async () => undefined),
+    getRun: vi.fn(async () => null),
+    getActiveRunForAgent: vi.fn(async () => null),
+    cancelRun: vi.fn(async () => null),
+  }),
+  instanceSettingsService: () => ({
+    get: vi.fn(async () => ({
+      id: "instance-settings-1",
+      general: {
+        censorUsernameInLogs: false,
+        feedbackDataSharingPreference: "prompt",
+      },
+    })),
+    getGeneral: vi.fn(async () => ({ censorUsernameInLogs: false })),
+    listCompanyIds: vi.fn(async () => ["company-1"]),
+  }),
+  issueApprovalService: () => ({}),
+  issueService: () => mockIssueService,
+  logActivity: mockLogActivity,
+  projectService: () => ({}),
+  routineService: () => ({ syncRunStatusForIssue: vi.fn(async () => undefined) }),
+  workProductService: () => ({}),
+}));
 
 async function installActor(app: express.Express, actor?: Record<string, unknown>) {
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
-    vi.importActual<typeof import("../routes/issues.js")>("../routes/issues.js"),
-    vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
+    import("../routes/issues.js"),
+    import("../middleware/index.js"),
   ]);
 
   app.use((req, _res, next) => {
@@ -93,6 +98,8 @@ function makeLockedIssue(overrides: Record<string, unknown> = {}) {
     executionLockedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
     identifier: "PAP-1906",
     title: "Stale locked issue",
+    labels: [],
+    labelIds: [],
     ...overrides,
   };
 }
@@ -123,20 +130,16 @@ const AGENT_WITH_PERMISSION = {
 };
 
 describe("POST /api/issues/:id/force-release", () => {
-  beforeAll(async () => {
-    // Pre-warm module loading so subsequent tests don't hit the cold-start timeout.
-    registerModuleMocks();
-    await vi.importActual("../routes/issues.js");
-    await vi.importActual("../middleware/index.js");
-  }, 20_000);
-
   beforeEach(() => {
-    vi.resetModules();
-    registerModuleMocks();
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeLockedIssue());
     mockIssueService.addComment.mockResolvedValue({ id: "comment-1", body: "Force-release applied" });
+    mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.findMentionedAgents.mockResolvedValue([]);
+    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockAccessService.hasPermission.mockResolvedValue(false);
+    mockLogActivity.mockResolvedValue(undefined);
   });
 
   it("returns 404 when the issue does not exist", async () => {
@@ -199,7 +202,6 @@ describe("POST /api/issues/:id/force-release", () => {
 
   it("returns 409 lock_not_stale when the service rejects a fresh lock", async () => {
     mockAccessService.hasPermission.mockResolvedValue(true);
-    const { HttpError } = await import("../errors.js");
     mockIssueService.forceRelease.mockRejectedValue(new HttpError(409, "lock_not_stale"));
     const app = await installActor(express().use(express.json()), AGENT_WITH_PERMISSION);
 
@@ -213,7 +215,6 @@ describe("POST /api/issues/:id/force-release", () => {
 
   it("returns 409 active_run_present when the service detects a live run", async () => {
     mockAccessService.hasPermission.mockResolvedValue(true);
-    const { HttpError } = await import("../errors.js");
     mockIssueService.forceRelease.mockRejectedValue(new HttpError(409, "active_run_present"));
     const app = await installActor(express().use(express.json()), AGENT_WITH_PERMISSION);
 
@@ -273,20 +274,18 @@ describe("POST /api/issues/:id/force-release", () => {
       .post("/api/issues/11111111-1111-4111-8111-111111111111/force-release")
       .send({});
 
-    await vi.waitFor(() => {
-      expect(mockLogActivity).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          action: "issue.force_released",
-          entityType: "issue",
-          entityId: "11111111-1111-4111-8111-111111111111",
-          details: expect.objectContaining({
-            clearedRunId: "stale-run-id",
-            reasonCode: "stale_cross_actor",
-          }),
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.force_released",
+        entityType: "issue",
+        entityId: "11111111-1111-4111-8111-111111111111",
+        details: expect.objectContaining({
+          clearedRunId: "stale-run-id",
+          reasonCode: "stale_cross_actor",
         }),
-      );
-    });
+      }),
+    );
   });
 
   it("allows board instance admin as emergency bypass without permission check", async () => {
