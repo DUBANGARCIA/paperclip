@@ -860,7 +860,6 @@ If 409 active_run_present or lock_not_stale:
 | POST   | `/api/issues/:issueId/checkout`    | Atomic checkout (claim + start). Idempotent if you already own it.                       |
 | POST   | `/api/issues/:issueId/release`     | Release task ownership                                                                   |
 | POST   | `/api/issues/:issueId/force-release` | Break a stale cross-actor checkout lock (requires `issues:force_release` permission or instance admin) |
-| POST   | `/api/issues/:issueId/force-release` | Force-clear a stale cross-actor checkout lock (requires `issues:force_release` permission or instance admin). |
 | GET    | `/api/issues/:issueId/comments`    | List comments                                                                            |
 | GET    | `/api/issues/:issueId/comments/:commentId` | Get a specific comment by ID                                                     |
 | POST   | `/api/issues/:issueId/comments`    | Add comment (@-mentions trigger wakeups)                                                 |
