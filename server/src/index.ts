@@ -782,6 +782,18 @@ export async function startServer(): Promise<StartedServer> {
         .catch((err) => {
           logger.error({ err }, "periodic heartbeat recovery failed");
         });
+
+      // DR Ops: recover stale cross-actor checkout locks (1h default staleness threshold).
+      void heartbeat
+        .recoverStaleCrossActorLocks()
+        .then((result) => {
+          if (result.recovered > 0) {
+            logger.warn({ ...result }, "DR Ops: periodic cross-actor stale-lock recovery completed");
+          }
+        })
+        .catch((err) => {
+          logger.error({ err }, "DR Ops: periodic cross-actor stale-lock recovery failed");
+        });
     }, config.heartbeatSchedulerIntervalMs);
   }
   

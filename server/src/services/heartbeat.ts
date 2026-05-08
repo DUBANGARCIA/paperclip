@@ -3,7 +3,7 @@ import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { and, asc, desc, eq, getTableColumns, gt, inArray, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, gt, inArray, isNotNull, isNull, lt, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -6564,6 +6564,110 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileIssueGraphLiveness(opts);
   }
 
+  async function recoverStaleCrossActorLocks(opts?: {
+    actorAgentId?: string | null;
+    actorRunId?: string | null;
+    stalenessThresholdMs?: number;
+  }) {
+    const MIN_STALENESS_MS = 15 * 60 * 1000;
+    const DEFAULT_STALENESS_MS = 60 * 60 * 1000;
+    const stalenessThresholdMs = Math.max(
+      MIN_STALENESS_MS,
+      opts?.stalenessThresholdMs ?? DEFAULT_STALENESS_MS,
+    );
+    const thresholdDate = new Date(Date.now() - stalenessThresholdMs);
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        checkoutRunId: issues.checkoutRunId,
+        executionLockedAt: issues.executionLockedAt,
+        assigneeAgentId: issues.assigneeAgentId,
+      })
+      .from(issues)
+      .where(
+        and(
+          inArray(issues.status, ["in_progress", "in_review", "blocked"]),
+          isNotNull(issues.checkoutRunId),
+          isNotNull(issues.executionLockedAt),
+          lt(issues.executionLockedAt, thresholdDate),
+        ),
+      );
+
+    const result = { recovered: 0, skipped: 0, activeRunPresent: 0, lockNotStale: 0, errors: 0 };
+
+    for (const issue of candidates) {
+      if (!issue.checkoutRunId) continue;
+
+      // Skip same-actor issues — the caller owns this lock, use /release instead
+      if (opts?.actorAgentId && issue.assigneeAgentId === opts.actorAgentId) {
+        result.skipped++;
+        continue;
+      }
+
+      // Check whether the holding run is still alive
+      const liveRun = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, issue.checkoutRunId),
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (liveRun) {
+        logger.debug(
+          { issueId: issue.id, checkoutRunId: issue.checkoutRunId },
+          "DR Ops: skipping stale-lock candidate — run is still active",
+        );
+        result.activeRunPresent++;
+        result.skipped++;
+        continue;
+      }
+
+      try {
+        const released = await issuesSvc.forceRelease(issue.id, {
+          actorAgentId: opts?.actorAgentId ?? null,
+          actorRunId: opts?.actorRunId ?? null,
+          reason: "DR Ops force-release: stale cross-actor lock",
+          runIdHeld: issue.checkoutRunId,
+          stalenessThresholdMs,
+        });
+
+        if (released) {
+          logger.info(
+            { issueId: issue.id, clearedRunId: issue.checkoutRunId },
+            "DR Ops: force-released stale cross-actor lock",
+          );
+          result.recovered++;
+        } else {
+          result.skipped++;
+        }
+      } catch (error) {
+        if (error instanceof HttpError && error.status === 409 && error.message === "active_run_present") {
+          result.activeRunPresent++;
+          result.skipped++;
+        } else if (error instanceof HttpError && error.status === 409 && error.message === "lock_not_stale") {
+          result.lockNotStale++;
+          result.skipped++;
+        } else {
+          logger.warn({ issueId: issue.id, error }, "DR Ops: unexpected error during force-release");
+          result.errors++;
+        }
+      }
+    }
+
+    if (result.recovered > 0) {
+      logger.warn({ ...result }, "DR Ops: recovered stale cross-actor checkout locks");
+    }
+
+    return result;
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -9627,6 +9731,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileProductivityReviews,
 
     buildRunOutputSilence,
+
+    recoverStaleCrossActorLocks,
 
     tickTimers: async (now = new Date()) => {
       const allAgents = await db.select().from(agents);
