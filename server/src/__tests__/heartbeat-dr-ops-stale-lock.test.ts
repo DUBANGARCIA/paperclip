@@ -33,23 +33,21 @@ vi.mock("@paperclipai/shared/telemetry", async () => {
   return { ...actual };
 });
 
-vi.mock("../adapters/index.ts", async () => {
-  const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
-  return {
-    ...actual,
-    getServerAdapter: vi.fn(() => ({
-      supportsLocalAgentJwt: false,
-      execute: vi.fn(async () => ({
-        exitCode: 0,
-        signal: null,
-        timedOut: false,
-        errorMessage: null,
-        provider: "test",
-        model: "test-model",
-      })),
+vi.mock("../adapters/index.ts", () => ({
+  getServerAdapter: vi.fn(() => ({
+    supportsLocalAgentJwt: false,
+    execute: vi.fn(async () => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      provider: "test",
+      model: "test-model",
     })),
-  };
-});
+  })),
+  listAdapterModelProfiles: vi.fn(async () => []),
+  runningProcesses: new Map(),
+}));
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
