@@ -130,6 +130,13 @@ const AGENT_WITH_PERMISSION = {
 };
 
 describe("POST /api/issues/:id/force-release", () => {
+  beforeAll(async () => {
+    await Promise.all([
+      import("../routes/issues.js"),
+      import("../middleware/index.js"),
+    ]);
+  }, 20_000);
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockResolvedValue(makeLockedIssue());
