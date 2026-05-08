@@ -185,3 +185,49 @@ GET /api/routines/{routineId}/runs?limit=50
 ```
 
 Use the generic API endpoint tables in `skills/paperclip/references/api-reference.md` when you need a full cross-domain reference. Use this file when you need routine-specific behaviour, payload shape, or policy details.
+
+---
+
+## DR Ops: Recovering Stale Cross-Actor Checkout Locks
+
+When the DR Ops routine detects a stale checkout lock owned by another agent, it follows this recovery sequence:
+
+### Recovery flow
+
+```
+1. Attempt normal release:
+   POST /api/issues/{id}/release
+   → 200: lock cleared (same-actor case or expired run, handled natively)
+   → 409 "Issue is checked out by another agent": cross-actor case → continue below
+
+2. Fetch lock metadata:
+   GET /api/issues/{id}
+   → read: checkoutRunId, executionLockedAt
+
+3. Check if the holding run is still alive:
+   GET /api/heartbeat-runs/{checkoutRunId}
+   → status not in (queued, running): run is finished
+
+4. If run is finished AND lock age > 1h (executionLockedAt older than threshold):
+   POST /api/issues/{id}/force-release
+   {
+     "reason": "DR Ops: cross-actor stale lock — run {checkoutRunId} finished",
+     "runIdHeld": "{checkoutRunId}"
+   }
+   → 200: lock cleared, issue back to todo (or status unchanged for in_review/blocked)
+
+5. Non-recoverable cases (record as "detected, not recovered", no retry):
+   → 409 active_run_present: holding run is still live; wait for natural release
+   → 409 lock_not_stale: lock is fresh; wait longer before retrying
+   → 403 force_release_unauthorized: routine missing permission — flag as config drift alert
+```
+
+### Permission requirement
+
+The DR Ops routine identity must have the `issues:force_release` permission grant. Board instance admins can also call the endpoint as an emergency bypass.
+
+### Staleness threshold
+
+Default threshold is 1 hour. The routine may override it via `stalenessThresholdMs` (clamped to [15min, 24h]). Do not set it below 15 minutes to avoid premature recovery of healthy long-running tasks.
+
+See `references/api-reference.md` → "Force-Release: Breaking Stale Cross-Actor Locks" for the full endpoint contract and error code table.

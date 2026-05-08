@@ -740,6 +740,77 @@ Terminal states: `done`, `cancelled`
 
 ---
 
+## Force-Release: Breaking Stale Cross-Actor Locks
+
+When an agent's heartbeat dies before releasing a checkout lock, the issue stays `in_progress` indefinitely. The DR Ops routine uses `force-release` to recover these cases.
+
+### `POST /api/issues/{issueId}/force-release`
+
+**Auth (any one):**
+- Agent with the `issues:force_release` permission grant (granted to the DR Ops routine identity).
+- Board instance admin (`local_implicit` source or `isInstanceAdmin: true`) — emergency bypass.
+
+**Request body (all optional):**
+
+```json
+{
+  "reason": "DR Ops cross-actor stale lock — runId abc123 ended 2h ago",
+  "runIdHeld": "abc123-...",
+  "stalenessThresholdMs": 3600000
+}
+```
+
+- `stalenessThresholdMs`: override the default 1h threshold. Clamped to [15min, 24h].
+
+**Server-side guards (all must pass):**
+1. Issue has a non-null `checkoutRunId`.
+2. No `activeRun` row with status `queued` or `running` for that run ID.
+3. Lock age (`executionLockedAt`) exceeds `stalenessThresholdMs` (default 1h).
+4. Issue is not in a terminal state (`done`/`cancelled`).
+
+**Success response (200):**
+
+```json
+{
+  "forceReleased": true,
+  "clearedRunId": "abc123-...",
+  "reasonCode": "stale_cross_actor",
+  "actorAgentId": "...",
+  "actorRunId": "...",
+  "stalenessMs": 7200000,
+  "status": "todo",
+  "...": "... (full issue fields)"
+}
+```
+
+Side effects: lock fields cleared (`checkoutRunId`, `executionRunId`, `executionAgentNameKey`, `executionLockedAt`), `in_progress` status moved back to `todo`, activity event `issue.force_released` logged, and a system comment posted on the issue.
+
+**Error codes:**
+
+| Status | Code | Meaning |
+| ------ | ---- | ------- |
+| 403 | `force_release_unauthorized` | Caller lacks permission and is not an instance admin |
+| 404 | — | Issue not found or no lock present |
+| 409 | `active_run_present` | Run is still alive — use regular retry, not force-release |
+| 409 | `lock_not_stale` | Lock is younger than threshold — do not retry |
+| 409 | `same_actor_use_release` | Caller owns the lock — use `POST /release` instead |
+| 422 | `issue_in_terminal_state` | Issue is `done` or `cancelled` |
+
+**DR Ops routine usage pattern:**
+
+```
+POST /api/issues/{id}/release       → 409 "Issue is checked out by another agent"
+GET /api/issues/{id}                → check executionLockedAt + checkoutRunId
+GET /api/heartbeat-runs/{runId}     → verify run is finished (status not queued/running)
+If stale (>1h) AND no live run:
+  POST /api/issues/{id}/force-release { "reason": "...", "runIdHeld": "..." }
+  → 200: lock cleared, issue back to todo
+If 409 active_run_present or lock_not_stale:
+  Record as "detected, not recovered" — do not retry
+```
+
+---
+
 ## Error Handling
 
 | Code | Meaning            | What to Do                                                           |
@@ -788,6 +859,8 @@ Terminal states: `done`, `cancelled`
 | PATCH  | `/api/issues/:issueId`             | Update issue (optional `comment` field; `blockedByIssueIds` replaces blocker set)        |
 | POST   | `/api/issues/:issueId/checkout`    | Atomic checkout (claim + start). Idempotent if you already own it.                       |
 | POST   | `/api/issues/:issueId/release`     | Release task ownership                                                                   |
+| POST   | `/api/issues/:issueId/force-release` | Break a stale cross-actor checkout lock (requires `issues:force_release` permission or instance admin) |
+| POST   | `/api/issues/:issueId/force-release` | Force-clear a stale cross-actor checkout lock (requires `issues:force_release` permission or instance admin). |
 | GET    | `/api/issues/:issueId/comments`    | List comments                                                                            |
 | GET    | `/api/issues/:issueId/comments/:commentId` | Get a specific comment by ID                                                     |
 | POST   | `/api/issues/:issueId/comments`    | Add comment (@-mentions trigger wakeups)                                                 |

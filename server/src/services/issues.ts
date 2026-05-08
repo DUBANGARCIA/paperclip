@@ -3698,6 +3698,100 @@ export function issueService(db: Db) {
         };
       }),
 
+    forceRelease: async (
+      id: string,
+      opts: {
+        actorAgentId?: string | null;
+        actorRunId?: string | null;
+        reason?: string | null;
+        runIdHeld?: string | null;
+        stalenessThresholdMs?: number | null;
+      },
+    ) => {
+      const MIN_STALENESS_MS = 15 * 60 * 1000;
+      const MAX_STALENESS_MS = 24 * 60 * 60 * 1000;
+      const DEFAULT_STALENESS_MS = 60 * 60 * 1000;
+
+      const thresholdMs =
+        opts.stalenessThresholdMs != null
+          ? Math.max(MIN_STALENESS_MS, Math.min(MAX_STALENESS_MS, opts.stalenessThresholdMs))
+          : DEFAULT_STALENESS_MS;
+
+      const existing = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, id))
+        .then((rows) => rows[0] ?? null);
+
+      if (!existing) return null;
+
+      const TERMINAL_STATUSES = new Set(["done", "cancelled"]);
+      if (TERMINAL_STATUSES.has(existing.status)) {
+        throw unprocessable("issue_in_terminal_state");
+      }
+
+      if (!existing.checkoutRunId) {
+        return null;
+      }
+
+      // Check if a live activeRun exists for the checkout run
+      const liveRun = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.id, existing.checkoutRunId),
+            inArray(heartbeatRuns.status, ACTIVE_RUN_STATUSES),
+          ),
+        )
+        .then((rows) => rows[0] ?? null);
+
+      if (liveRun) {
+        throw conflict("active_run_present");
+      }
+
+      // Check staleness using executionLockedAt
+      const lockAcquiredAt = existing.executionLockedAt;
+      if (!lockAcquiredAt || Date.now() - lockAcquiredAt.getTime() < thresholdMs) {
+        throw conflict("lock_not_stale");
+      }
+
+      const clearedRunId = existing.checkoutRunId;
+      const newStatus = existing.status === "in_progress" ? "todo" : existing.status;
+
+      const patch: Partial<typeof issues.$inferInsert> = {
+        checkoutRunId: null,
+        executionRunId: null,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+        updatedAt: new Date(),
+      };
+      if (newStatus !== existing.status) {
+        patch.status = newStatus;
+        patch.assigneeAgentId = null;
+      }
+
+      const updated = await db
+        .update(issues)
+        .set(patch)
+        .where(eq(issues.id, id))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!updated) return null;
+      const [enriched] = await withIssueLabels(db, [updated]);
+      return {
+        ...enriched,
+        forceReleased: true as const,
+        clearedRunId,
+        reasonCode: "stale_cross_actor" as const,
+        actorAgentId: opts.actorAgentId ?? null,
+        actorRunId: opts.actorRunId ?? null,
+        reason: opts.reason ?? null,
+        stalenessMs: Date.now() - lockAcquiredAt.getTime(),
+      };
+    },
+
     listLabels: (companyId: string) =>
       db.select().from(labels).where(eq(labels.companyId, companyId)).orderBy(asc(labels.name), asc(labels.id)),
 

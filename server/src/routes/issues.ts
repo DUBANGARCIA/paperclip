@@ -3587,6 +3587,94 @@ export function issueRoutes(
     res.json(result);
   });
 
+  router.post("/issues/:id/force-release", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Issue not found" });
+      return;
+    }
+    assertCompanyAccess(req, existing.companyId);
+
+    // Auth: board instance admin is emergency bypass; agents need issues:force_release
+    const isInstanceAdmin =
+      req.actor.type === "board" &&
+      (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin);
+
+    if (!isInstanceAdmin) {
+      if (req.actor.type !== "agent" || !req.actor.agentId) {
+        res.status(403).json({ error: "force_release_unauthorized" });
+        return;
+      }
+      const allowed = await access.hasPermission(
+        existing.companyId,
+        "agent",
+        req.actor.agentId,
+        "issues:force_release",
+      );
+      if (!allowed) {
+        res.status(403).json({ error: "force_release_unauthorized" });
+        return;
+      }
+    }
+
+    // Force-release is cross-actor only; same assignee should use /release
+    if (req.actor.type === "agent" && req.actor.agentId && existing.assigneeAgentId === req.actor.agentId) {
+      res.status(409).json({ error: "same_actor_use_release" });
+      return;
+    }
+
+    const body = req.body as {
+      reason?: string;
+      runIdHeld?: string;
+      stalenessThresholdMs?: number;
+    };
+
+    const actor = getActorInfo(req);
+
+    const result = await svc.forceRelease(id, {
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId : null,
+      actorRunId: actor.runId,
+      reason: body.reason ?? null,
+      runIdHeld: body.runIdHeld ?? null,
+      stalenessThresholdMs: typeof body.stalenessThresholdMs === "number" ? body.stalenessThresholdMs : null,
+    });
+
+    if (!result) {
+      res.status(404).json({ error: "Issue not found or no active lock" });
+      return;
+    }
+
+    const heldMs = result.stalenessMs;
+    const heldSince = result.clearedRunId
+      ? new Date(Date.now() - heldMs).toISOString()
+      : null;
+    const commentBody =
+      `Force-release applied: stale cross-actor lock cleared.` +
+      ` Cleared run ${result.clearedRunId ?? "unknown"} (held since ${heldSince ?? "unknown"}).`;
+
+    await svc.addComment(id, commentBody, { agentId: undefined, userId: undefined, runId: null });
+
+    await logActivity(db, {
+      companyId: existing.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      action: "issue.force_released",
+      entityType: "issue",
+      entityId: existing.id,
+      details: {
+        clearedRunId: result.clearedRunId,
+        reasonCode: result.reasonCode,
+        reason: result.reason,
+        stalenessMs: result.stalenessMs,
+      },
+    });
+
+    res.json(result);
+  });
+
   router.get("/issues/:id/comments", async (req, res) => {
     const id = req.params.id as string;
     const issue = await svc.getById(id);
