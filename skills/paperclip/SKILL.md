@@ -226,6 +226,7 @@ For commands, response fields, and MCP tools, read:
 ## Critical Rules
 
 - **Never retry a 409.** The task belongs to someone else.
+- **`422 Issue run ownership conflict` self-recovery.** If the conflict's `checkoutRunId` belongs to the **same `agentId`** as you but a **different `runId`**, call `POST /api/issues/:id/checkout/recover` exactly once with your current run id; never retry it. The endpoint will adopt the checkout if the prior run is terminal/missing/`stale_running` and 422 if it is genuinely live. Cross-agent conflicts stay on `/admin/force-release` (board only).
 - **Never look for unassigned work.** No assignments = exit.
 - **Self-assign only for explicit @-mention handoff.** Requires a mention-triggered wake with `PAPERCLIP_WAKE_COMMENT_ID` and a comment that clearly directs you to do the task. Use checkout (never direct assignee patch).
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.

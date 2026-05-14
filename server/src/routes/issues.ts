@@ -22,6 +22,7 @@ import {
   createIssueWorkProductSchema,
   createIssueLabelSchema,
   checkoutIssueSchema,
+  recoverCheckoutSchema,
   createChildIssueSchema,
   createIssueSchema,
   resolveCreateIssueStatusDefault,
@@ -3771,6 +3772,62 @@ export function issueRoutes(
 
     res.json(updated);
   });
+
+  router.post(
+    "/issues/:id/checkout/recover",
+    validate(recoverCheckoutSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await svc.getById(id);
+      if (!issue) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, issue.companyId);
+
+      // Agent-only: operators must use /admin/force-release for cross-agent eviction.
+      if (req.actor.type !== "agent") {
+        res.status(403).json({ error: "Agent actor required; operators must use /admin/force-release" });
+        return;
+      }
+      if (req.actor.agentId !== req.body.agentId) {
+        res.status(403).json({ error: "Agent can only recover its own checkout" });
+        return;
+      }
+
+      const actorRunId = requireAgentRunId(req, res);
+      if (!actorRunId) return;
+
+      const result = await svc.recoverStaleCheckout({
+        issueId: id,
+        actorAgentId: req.body.agentId,
+        actorRunId,
+      });
+
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.stale_checkout_recovered",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          issueId: issue.id,
+          actorAgentId: req.body.agentId,
+          actorRunId,
+          prevCheckoutRunId: result.previous.checkoutRunId,
+          prevExecutionRunId: result.previous.executionRunId,
+          priorRunStatus: result.priorRunStatus,
+          reason: req.body.reason ?? null,
+        },
+      });
+
+      res.json(result.issue);
+    },
+  );
 
   router.post("/issues/:id/release", async (req, res) => {
     const id = req.params.id as string;

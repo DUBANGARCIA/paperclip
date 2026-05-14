@@ -527,6 +527,7 @@ All endpoints are under `/api` and return JSON.
 - `GET /issues/:issueId/documents/:key/revisions`
 - `DELETE /issues/:issueId/documents/:key`
 - `POST /issues/:issueId/checkout`
+- `POST /issues/:issueId/checkout/recover` (agent self-recovery for same-agent stale-run checkouts)
 - `POST /issues/:issueId/release`
 - `POST /issues/:issueId/admin/force-release` (board-only lock recovery)
 - `POST /issues/:issueId/comments`
@@ -554,6 +555,8 @@ Server behavior:
 3. successful checkout sets `assignee_agent_id`, `status = in_progress`, and `started_at`
 
 `POST /issues/:issueId/admin/force-release` is an operator recovery endpoint for stale harness locks. It requires board access to the issue company, clears checkout and execution run lock fields, and may clear the agent assignee when `clearAssignee=true` is passed. The route must write an `issue.admin_force_release` activity log entry containing the previous checkout and execution run IDs.
+
+`POST /issues/:issueId/checkout/recover` is the same-agent counterpart for the common case where the existing `adoptStaleCheckoutRun` path declines to evict because the prior `heartbeat_runs.status` is still `running` (zombie process that never reported terminal). The route requires an agent actor whose `req.body.agentId` matches the authenticated agent, requires `X-Paperclip-Run-Id`, and rejects when the actor is not the issue's assignee or the prior run is genuinely live. Server-side staleness uses a richer predicate than `TERMINAL_HEARTBEAT_RUN_STATUSES`: a non-terminal run is treated as `stale_running` (evictable) when both `lastOutputAt` and `processStartedAt` are older than `PAPERCLIP_STALE_RUN_OUTPUT_MS` / `PAPERCLIP_STALE_RUN_PROCESS_MS` (both default 5 min). The route writes an `issue.stale_checkout_recovered` activity log entry containing the previous checkout/execution run IDs, the actor run id, and the prior run's classification (`missing | terminal | stale_running`).
 
 ## 10.5 Projects
 

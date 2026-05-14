@@ -327,6 +327,21 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+
+// A heartbeat run that says it is still "running" (or "queued"/"scheduled_retry") but has not
+// produced output and has not been freshly started for this long is treated as a zombie. The
+// existing checkout adoption path treats it as evictable, and the agent-callable
+// /checkout/recover endpoint uses the same predicate. Configurable via env so on-call can
+// tune without a code change if real long-running tools start tripping it.
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw == null) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+const STALE_RUN_NO_OUTPUT_MS = readPositiveIntEnv("PAPERCLIP_STALE_RUN_OUTPUT_MS", 5 * 60 * 1000);
+const STALE_RUN_NO_PROCESS_START_MS = readPositiveIntEnv("PAPERCLIP_STALE_RUN_PROCESS_MS", 5 * 60 * 1000);
+
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -3243,14 +3258,71 @@ export function issueService(db: Db) {
     );
   }
 
-  async function isTerminalOrMissingHeartbeatRun(runId: string) {
+  type HeartbeatRunStalenessKind = "missing" | "terminal" | "stale_running" | "live";
+
+  type HeartbeatRunStalenessResult =
+    | { kind: "missing" }
+    | { kind: "terminal"; status: string }
+    | {
+        kind: "stale_running";
+        status: string;
+        lastOutputAt: Date | null;
+        processStartedAt: Date | null;
+        startedAt: Date | null;
+      }
+    | {
+        kind: "live";
+        status: string;
+        lastOutputAt: Date | null;
+        processStartedAt: Date | null;
+        startedAt: Date | null;
+      };
+
+  function olderThan(value: Date | null, ms: number, now: Date) {
+    return value == null || now.getTime() - value.getTime() >= ms;
+  }
+
+  async function classifyHeartbeatRunStaleness(runId: string): Promise<HeartbeatRunStalenessResult> {
     const run = await db
-      .select({ status: heartbeatRuns.status })
+      .select({
+        status: heartbeatRuns.status,
+        startedAt: heartbeatRuns.startedAt,
+        processStartedAt: heartbeatRuns.processStartedAt,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
-    if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (!run) return { kind: "missing" };
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+      return { kind: "terminal", status: run.status };
+    }
+    const now = new Date();
+    const noOutputForLongEnough = olderThan(run.lastOutputAt, STALE_RUN_NO_OUTPUT_MS, now);
+    const noProcessForLongEnough = olderThan(run.processStartedAt, STALE_RUN_NO_PROCESS_START_MS, now);
+    // Both clocks must agree before we declare a non-terminal run stale, so we don't evict
+    // a freshly-started run that simply hasn't logged yet.
+    if (noOutputForLongEnough && noProcessForLongEnough) {
+      return {
+        kind: "stale_running",
+        status: run.status,
+        lastOutputAt: run.lastOutputAt,
+        processStartedAt: run.processStartedAt,
+        startedAt: run.startedAt,
+      };
+    }
+    return {
+      kind: "live",
+      status: run.status,
+      lastOutputAt: run.lastOutputAt,
+      processStartedAt: run.processStartedAt,
+      startedAt: run.startedAt,
+    };
+  }
+
+  async function isTerminalOrMissingHeartbeatRun(runId: string) {
+    const classification = await classifyHeartbeatRunStaleness(runId);
+    return classification.kind !== "live";
   }
 
   async function adoptStaleCheckoutRun(input: {
@@ -4893,6 +4965,162 @@ export function issueService(db: Db) {
             checkoutRunId: existing.checkoutRunId,
             executionRunId: existing.executionRunId,
           },
+        };
+      }),
+
+    // Agent-callable recovery for stale-run checkouts the requesting agent owns.
+    // Allowed when (a) the actor agent is the issue's assignee, AND (b) the prior
+    // checkoutRunId points at a run that is terminal, missing, or stale_running
+    // (still flagged "running" but past the configured liveness threshold).
+    // Cross-agent eviction stays on /admin/force-release.
+    recoverStaleCheckout: async (input: {
+      issueId: string;
+      actorAgentId: string;
+      actorRunId: string;
+    }): Promise<{
+      issue: IssueWithLabels;
+      previous: { checkoutRunId: string | null; executionRunId: string | null };
+      priorRunStatus: HeartbeatRunStalenessKind;
+    }> =>
+      db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issueId} for update`,
+        );
+        const existing = await tx
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            checkoutRunId: issues.checkoutRunId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(eq(issues.id, input.issueId))
+          .then((rows) => rows[0] ?? null);
+
+        if (!existing) throw notFound("Issue not found");
+
+        // Cross-agent eviction is reserved for /admin/force-release.
+        if (existing.assigneeAgentId && existing.assigneeAgentId !== input.actorAgentId) {
+          throw unprocessable(
+            "Only the issue's assignee agent may recover its own stale checkout. Operators must use /admin/force-release for cross-agent eviction.",
+            {
+              issueId: existing.id,
+              assigneeAgentId: existing.assigneeAgentId,
+              actorAgentId: input.actorAgentId,
+            },
+          );
+        }
+
+        // Already owned by this run — idempotent success.
+        if (
+          existing.checkoutRunId === input.actorRunId &&
+          existing.executionRunId === input.actorRunId
+        ) {
+          const row = await tx
+            .select()
+            .from(issues)
+            .where(eq(issues.id, existing.id))
+            .then((rows) => rows[0] ?? null);
+          if (!row) throw notFound("Issue not found");
+          const [enriched] = await withIssueLabels(tx, [row]);
+          return {
+            issue: enriched,
+            previous: {
+              checkoutRunId: existing.checkoutRunId,
+              executionRunId: existing.executionRunId,
+            },
+            priorRunStatus: "live" as HeartbeatRunStalenessKind,
+          };
+        }
+
+        // No existing checkout — adopt cleanly if the actor is (or can be) the assignee.
+        if (existing.checkoutRunId == null && existing.executionRunId == null) {
+          const updated = await tx
+            .update(issues)
+            .set({
+              assigneeAgentId: input.actorAgentId,
+              assigneeUserId: null,
+              checkoutRunId: input.actorRunId,
+              executionRunId: input.actorRunId,
+              status: existing.status === "in_progress" ? existing.status : "in_progress",
+              executionLockedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(
+              and(
+                eq(issues.id, existing.id),
+                isNull(issues.checkoutRunId),
+                isNull(issues.executionRunId),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (!updated) {
+            throw conflict("Issue checkout state changed during recovery; retry");
+          }
+          const [enriched] = await withIssueLabels(tx, [updated]);
+          return {
+            issue: enriched,
+            previous: { checkoutRunId: null, executionRunId: null },
+            priorRunStatus: "missing" as HeartbeatRunStalenessKind,
+          };
+        }
+
+        // Otherwise: classify the prior run. Only adopt if it is non-live.
+        const priorRunId = existing.checkoutRunId ?? existing.executionRunId;
+        if (!priorRunId) {
+          throw conflict("Issue checkout state changed during recovery; retry");
+        }
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${priorRunId} for update`,
+        );
+        const classification = await classifyHeartbeatRunStaleness(priorRunId);
+        if (classification.kind === "live") {
+          throw unprocessable("Prior checkout run is still live", {
+            issueId: existing.id,
+            priorRunId,
+            priorRunStatus: classification.status,
+            lastOutputAt: classification.lastOutputAt,
+            processStartedAt: classification.processStartedAt,
+            staleThresholds: {
+              noOutputForMs: STALE_RUN_NO_OUTPUT_MS,
+              noProcessStartForMs: STALE_RUN_NO_PROCESS_START_MS,
+            },
+          });
+        }
+
+        const updated = await tx
+          .update(issues)
+          .set({
+            checkoutRunId: input.actorRunId,
+            executionRunId: input.actorRunId,
+            executionLockedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, existing.id),
+              or(
+                eq(issues.checkoutRunId, priorRunId),
+                eq(issues.executionRunId, priorRunId),
+              ),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!updated) {
+          throw conflict("Issue checkout state changed during recovery; retry");
+        }
+        const [enriched] = await withIssueLabels(tx, [updated]);
+        return {
+          issue: enriched,
+          previous: {
+            checkoutRunId: existing.checkoutRunId,
+            executionRunId: existing.executionRunId,
+          },
+          priorRunStatus: classification.kind,
         };
       }),
 

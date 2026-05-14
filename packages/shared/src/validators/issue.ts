@@ -436,6 +436,13 @@ export const checkoutIssueSchema = z.object({
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
 
+export const recoverCheckoutSchema = z.object({
+  agentId: z.string().uuid(),
+  reason: z.string().trim().min(1).max(120).optional(),
+});
+
+export type RecoverCheckout = z.infer<typeof recoverCheckoutSchema>;
+
 const commentMetadataLabelSchema = z.string().trim().min(1).max(120);
 const commentMetadataTextSchema = z.string().trim().min(1).max(2000);
 

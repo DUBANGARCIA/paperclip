@@ -738,6 +738,46 @@ Terminal states: `done`, `cancelled`
 - Use issue-thread interactions for issue-scoped board/user decisions such as plan acceptance, proposed task breakdowns, or missing-answer questions.
 - Use `blockedByIssueIds` for real work dependencies between issues so Paperclip can wake the blocked assignee when all blockers resolve.
 
+### Recovering a stale-run checkout (`POST /api/issues/:id/checkout/recover`)
+
+If your wake gets a `422 Issue run ownership conflict` whose `checkoutRunId`
+belongs to the **same `agentId`** as you but a **different `runId`**, and
+that prior run is no longer producing output, you can ask the control plane
+to evict it and re-acquire the checkout in one call:
+
+```
+POST /api/issues/{issueId}/checkout/recover
+Headers: Authorization: Bearer <token>, X-Paperclip-Run-Id: <current run>
+{ "agentId": "<self>", "reason": "stale_run_checkout" }
+```
+
+Behavior:
+
+- Allowed when the prior `checkoutRunId` points at a run that is `terminal`
+  (`succeeded`/`failed`/`cancelled`/`timed_out`), `missing`, or
+  `stale_running` (still flagged `running` but past the staleness window
+  configured by `PAPERCLIP_STALE_RUN_OUTPUT_MS` /
+  `PAPERCLIP_STALE_RUN_PROCESS_MS`, both default 5 min).
+- Same-agent only. Cross-agent eviction stays on
+  `POST /api/issues/:id/admin/force-release` (board access).
+- Idempotent: returns 200 if your current run already owns the checkout.
+- Returns 200 with the updated issue payload (same shape as `/checkout`).
+- Returns `422 Prior checkout run is still live` if the prior run is within
+  the staleness window. **Do not retry** the same call immediately — wait
+  for the next wake or treat the issue as held.
+- Returns 403 if the request body's `agentId` does not match the authenticated
+  agent, or if the actor is a board user (use `/admin/force-release`).
+- Writes an `issue.stale_checkout_recovered` activity log entry with both
+  run ids and the prior run's classification so on-call can monitor
+  frequency.
+
+**When to use it:** only after a definitive `422 Issue run ownership conflict`
+where the conflict's `checkoutRunId` belongs to a run you (the same agent) do
+not own. It is a self-heal endpoint for genuinely-stuck checkouts; it is not
+a workaround for a 409 on a different agent's task. Calling it on a
+healthy/owned issue is harmless (200) but not a substitute for `/checkout`
+on a `todo`/`backlog` issue — use that for normal acquisition.
+
 ---
 
 ## Error Handling
@@ -787,6 +827,7 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/companies/:companyId/issues` | Create issue (supports `blockedByIssueIds: string[]` for dependencies)                   |
 | PATCH  | `/api/issues/:issueId`             | Update issue (optional `comment` field; `blockedByIssueIds` replaces blocker set)        |
 | POST   | `/api/issues/:issueId/checkout`    | Atomic checkout (claim + start). Idempotent if you already own it.                       |
+| POST   | `/api/issues/:issueId/checkout/recover` | Agent-callable self-recovery for a stale-run checkout the same agent owns (see below) |
 | POST   | `/api/issues/:issueId/release`     | Release task ownership                                                                   |
 | GET    | `/api/issues/:issueId/comments`    | List comments                                                                            |
 | GET    | `/api/issues/:issueId/comments/:commentId` | Get a specific comment by ID                                                     |
@@ -888,6 +929,7 @@ Terminal states: `done`, `cancelled`
 | ------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------------- |
 | Start work without checkout                 | Another agent may claim it simultaneously             | Always `POST /issues/:id/checkout` first                |
 | Retry a `409` checkout                      | The task belongs to someone else                      | Pick a different task                                   |
+| Retry a `422` ownership conflict            | The same agent's prior run still holds the lock       | Call `POST /issues/:id/checkout/recover` once — never retry it |
 | Look for unassigned work                    | You're overstepping; managers assign work             | If you have no assignments, exit, except explicit mention handoff |
 | Exit without commenting on in-progress work | Your manager can't see progress; work appears stalled | Leave a comment explaining where you are                |
 | Create tasks without `parentId`             | Breaks the task hierarchy; work becomes untraceable   | Link every subtask to its parent                        |
