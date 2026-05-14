@@ -8914,6 +8914,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
 
+        // If no active execution run was found by issue-scoped lookup, check whether the
+        // same agent already has a running heartbeat in any scope. When true, coalescing
+        // the new issue wake into that run avoids creating a competing run whose id will
+        // diverge from the agent process's PAPERCLIP_RUN_ID, which would make every
+        // mutating API call on the new issue fail with 422 "Issue run ownership conflict".
+        if (
+          !activeExecutionRun &&
+          !shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId })
+        ) {
+          const agentRunningRun = await tx
+            .select()
+            .from(heartbeatRuns)
+            .where(
+              and(
+                eq(heartbeatRuns.agentId, agentId),
+                eq(heartbeatRuns.companyId, agent.companyId),
+                eq(heartbeatRuns.status, 'running'),
+              ),
+            )
+            .orderBy(desc(heartbeatRuns.createdAt))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (agentRunningRun) {
+            activeExecutionRun = agentRunningRun;
+          }
+        }
+
         const dependencyReadiness = await issuesSvc.listDependencyReadiness(
           issue.companyId,
           [issue.id],
