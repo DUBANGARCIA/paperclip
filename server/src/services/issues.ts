@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -325,6 +326,15 @@ export type ChildIssueCompletionSummary = {
 function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   if (actorRunId) return checkoutRunId === actorRunId;
   return checkoutRunId == null;
+}
+
+// Never emit the verbatim stored checkoutRunId in 409 conflict response bodies:
+// callers (incl. peer runs of the same agent) can replay it as X-Paperclip-Run-Id
+// to spoof checkout ownership. Hash it so the value is still useful for
+// diagnostics/log correlation but not directly replayable.
+function hashRunIdForResponse(runId: string | null | undefined): string | null {
+  if (!runId) return null;
+  return `sha256:${createHash("sha256").update(runId).digest("hex").slice(0, 16)}`;
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
@@ -4732,7 +4742,7 @@ export function issueService(db: Db) {
         issueId: current.id,
         status: current.status,
         assigneeAgentId: current.assigneeAgentId,
-        checkoutRunId: current.checkoutRunId,
+        prevCheckoutRunIdHash: hashRunIdForResponse(current.checkoutRunId),
         executionRunId: current.executionRunId,
       });
     },
@@ -4808,10 +4818,9 @@ export function issueService(db: Db) {
         issueId: current.id,
         status: current.status,
         assigneeAgentId: current.assigneeAgentId,
-        checkoutRunId: current.checkoutRunId,
+        prevCheckoutRunIdHash: hashRunIdForResponse(current.checkoutRunId),
         executionRunId: current.executionRunId,
         actorAgentId,
-        actorRunId,
       });
     },
 
@@ -4839,8 +4848,7 @@ export function issueService(db: Db) {
           throw conflict("Only checkout run can release issue", {
             issueId: existing.id,
             assigneeAgentId: existing.assigneeAgentId,
-            checkoutRunId: existing.checkoutRunId,
-            actorRunId: actorRunId ?? null,
+            prevCheckoutRunIdHash: hashRunIdForResponse(existing.checkoutRunId),
           });
         }
       }

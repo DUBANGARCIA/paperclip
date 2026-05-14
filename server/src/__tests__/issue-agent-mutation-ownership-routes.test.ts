@@ -231,7 +231,10 @@ function boardActor() {
   };
 }
 
-describe("agent issue mutation checkout ownership", () => {
+// First parameterized case re-imports the full route surface for the first time
+// per worker and routinely runs ~5s on slower CI agents; bump the default 5s
+// timeout to keep the suite green without papering over real regressions.
+describe("agent issue mutation checkout ownership", { timeout: 15_000 }, () => {
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
@@ -475,5 +478,46 @@ describe("agent issue mutation checkout ownership", () => {
       assigneeAgentId: null,
       title: "Claimable update",
     });
+  });
+
+  // BRA-2204: a stale checkoutRunId belonging to a previous run of the SAME
+  // agent must not be replayable as X-Paperclip-Run-Id by a current run of
+  // that agent. Auth precedence (claims.run_id over header) is tested at the
+  // actorMiddleware layer (auth-session-route.test.ts); here we cover the
+  // service-layer guard: when the actor's true runId (R1) differs from the
+  // stored checkoutRunId (R0), assertCheckoutOwner must 409 and the response
+  // body must not echo the verbatim stored checkoutRunId — only a hash.
+  it("rejects same-agent cross-run mutation and does not leak the stored checkoutRunId", async () => {
+    const { conflict } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    const previousCheckoutRunId = "99999999-9999-4999-8999-999999999999";
+    const hashedPrev = `sha256:${"a".repeat(16)}`;
+    mockIssueService.assertCheckoutOwner.mockImplementation(async () => {
+      throw conflict("Issue run ownership conflict", {
+        issueId,
+        status: "in_progress",
+        assigneeAgentId: ownerAgentId,
+        prevCheckoutRunIdHash: hashedPrev,
+        executionRunId: null,
+        actorAgentId: ownerAgentId,
+      });
+    });
+
+    const res = await request(await createApp(ownerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Header-spoof attempt" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe("Issue run ownership conflict");
+    expect(mockIssueService.assertCheckoutOwner).toHaveBeenCalledWith(issueId, ownerAgentId, ownerRunId);
+    // The verbatim previous-run checkoutRunId must NOT appear in the body —
+    // otherwise a hostile peer could read it and replay it as a header.
+    expect(JSON.stringify(res.body)).not.toContain(previousCheckoutRunId);
+    expect(res.body.details).toMatchObject({
+      issueId,
+      assigneeAgentId: ownerAgentId,
+      prevCheckoutRunIdHash: hashedPrev,
+    });
+    expect(res.body.details).not.toHaveProperty("checkoutRunId");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 });

@@ -158,12 +158,26 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
+      if (runIdHeader && claims.run_id && runIdHeader !== claims.run_id) {
+        logger.warn(
+          {
+            agentId: claims.sub,
+            companyId: claims.company_id,
+            claimRunId: claims.run_id,
+            headerRunId: runIdHeader,
+            method: req.method,
+            url: req.originalUrl,
+          },
+          "Agent JWT run_id claim diverges from X-Paperclip-Run-Id header; trusting claim",
+        );
+      }
+
       req.actor = {
         type: "agent",
         agentId: claims.sub,
         companyId: claims.company_id,
         keyId: undefined,
-        runId: runIdHeader || claims.run_id || undefined,
+        runId: claims.run_id ?? runIdHeader ?? undefined,
         source: "agent_jwt",
       };
       next();
