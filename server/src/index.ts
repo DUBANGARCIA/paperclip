@@ -739,6 +739,13 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "routine scheduler tick failed");
         });
   
+      // Periodically reap stale issue checkouts (runs that are terminal/missing/silent).
+      void heartbeat
+        .reapStaleCheckouts()
+        .catch((err: unknown) => {
+          logger.error({ err }, "stale checkout reaper failed");
+        });
+
       // Periodically reap orphaned runs (5-min staleness threshold) and make sure
       // persisted queued work is still being driven forward.
       void heartbeat

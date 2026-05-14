@@ -204,6 +204,10 @@ const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_r
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+const STALE_CHECKOUT_THRESHOLD_MS = (() => {
+  const raw = Number(process.env.PAPERCLIP_STALE_CHECKOUT_THRESHOLD_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15 * 60 * 1000;
+})();
 export {
   ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
@@ -6577,6 +6581,140 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { reaped: reaped.length, runIds: reaped };
   }
 
+  async function reapStaleCheckouts(opts?: { staleThresholdMs?: number }) {
+    const staleThresholdMs = opts?.staleThresholdMs ?? STALE_CHECKOUT_THRESHOLD_MS;
+    const now = new Date();
+
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(sql`${issues.checkoutRunId} is not null`);
+
+    const reaped: Array<{ issueId: string; reaperRunId: string; reason: string }> = [];
+
+    for (const issue of candidates) {
+      if (!issue.checkoutRunId) continue;
+
+      const run = await db
+        .select({
+          status: heartbeatRuns.status,
+          lastOutputAt: heartbeatRuns.lastOutputAt,
+          processStartedAt: heartbeatRuns.processStartedAt,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, issue.checkoutRunId))
+        .then((rows) => rows[0] ?? null);
+
+      let shouldReap = false;
+      let reason = "";
+
+      if (!run) {
+        shouldReap = true;
+        reason = "run_missing";
+      } else if (HEARTBEAT_RUN_TERMINAL_STATUSES.includes(run.status as typeof HEARTBEAT_RUN_TERMINAL_STATUSES[number])) {
+        shouldReap = true;
+        reason = `run_terminal:${run.status}`;
+      } else {
+        const lockedAt = issue.executionLockedAt;
+        if (lockedAt != null && now.getTime() - lockedAt.getTime() >= staleThresholdMs) {
+          const hasRecentOutput =
+            run.lastOutputAt != null &&
+            now.getTime() - run.lastOutputAt.getTime() < staleThresholdMs;
+          const hasRecentProcessStart =
+            run.processStartedAt != null &&
+            now.getTime() - run.processStartedAt.getTime() < staleThresholdMs;
+          if (!hasRecentOutput && !hasRecentProcessStart) {
+            shouldReap = true;
+            reason = "run_stale";
+          }
+        }
+      }
+
+      if (!shouldReap) continue;
+
+      const cleared = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select id from issues where id = ${issue.id} for update`,
+        );
+        const current = await tx
+          .select({ checkoutRunId: issues.checkoutRunId, assigneeAgentId: issues.assigneeAgentId })
+          .from(issues)
+          .where(eq(issues.id, issue.id))
+          .then((rows) => rows[0] ?? null);
+
+        if (!current || current.checkoutRunId !== issue.checkoutRunId) return null;
+
+        return tx
+          .update(issues)
+          .set({
+            checkoutRunId: null,
+            executionRunId: null,
+            executionLockedAt: null,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(issues.id, issue.id),
+              eq(issues.checkoutRunId, issue.checkoutRunId!),
+            ),
+          )
+          .returning({
+            id: issues.id,
+            companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+          })
+          .then((rows) => rows[0] ?? null);
+      });
+
+      if (!cleared) continue;
+
+      await logActivity(db, {
+        companyId: cleared.companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "issue.stale_checkout_reaped",
+        entityType: "issue",
+        entityId: cleared.id,
+        details: {
+          issueId: cleared.id,
+          reaperRunId: issue.checkoutRunId,
+          reason,
+          staleThresholdMs,
+        },
+      });
+
+      if (cleared.assigneeAgentId) {
+        await enqueueWakeup(cleared.assigneeAgentId, {
+          source: "assignment",
+          triggerDetail: "system",
+          reason: "stale_checkout_reaped",
+          payload: { issueId: cleared.id, mutation: "stale_checkout_reaped" },
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: { issueId: cleared.id, source: "stale_checkout_reaper" },
+        }).catch((err: unknown) => {
+          logger.warn({ err, issueId: cleared.id }, "failed to wake assignee after stale checkout reap");
+        });
+      }
+
+      reaped.push({ issueId: cleared.id, reaperRunId: issue.checkoutRunId, reason });
+    }
+
+    if (reaped.length > 0) {
+      logger.warn({ reapedCount: reaped.length, issues: reaped }, "reaped stale issue checkouts");
+    }
+    return { reaped: reaped.length, details: reaped };
+  }
+
   async function resumeQueuedRuns() {
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
@@ -9720,6 +9858,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reportRunActivity: clearDetachedRunWarning,
 
     reapOrphanedRuns,
+
+    reapStaleCheckouts,
 
     promoteDueScheduledRetries,
     retryScheduledRetryNow,
