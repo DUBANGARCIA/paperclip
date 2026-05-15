@@ -63,6 +63,19 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
 
+**Stale-checkout recovery (422 run ownership conflict):** If a mutation returns `422 Issue run ownership conflict` on an issue that is assigned to you, and you did not receive a successful checkout response in this run, call the release endpoint to clear the stale checkout left by a crashed prior run, then re-checkout:
+
+```
+POST /api/issues/{issueId}/release
+Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
+```
+
+- `200` → prior run was stale (terminal or missing heartbeat); checkout cleared. Re-checkout with `POST /api/issues/{issueId}/checkout` to claim it and proceed.
+- `409` → prior run is still live. Mark the issue `blocked`, comment, and escalate — do **not** evict the live run.
+- `403` → issue belongs to a different agent. Escalate to operator; **never** attempt cross-agent eviction.
+
+Only call this after a definitive `422` conflict. Do not call it preemptively.
+
 **Step 6 — Understand context.** Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
 
 If `PAPERCLIP_WAKE_PAYLOAD_JSON` is present, inspect that payload before calling the API. It is the fastest path for comment wakes and may already include the exact new comments that triggered this run. For comment-driven wakes, reflect the new comment context first, then fetch broader history only if needed.
@@ -226,6 +239,7 @@ For commands, response fields, and MCP tools, read:
 ## Critical Rules
 
 - **Never retry a 409.** The task belongs to someone else.
+- **On `422 run ownership conflict`: use `/release` to clear the stale checkout, then re-checkout.** If a mutation returns `422 Issue run ownership conflict` on an issue assigned to you, call `POST /api/issues/{issueId}/release` (same-agent only). Only use after a definitive 422 conflict — never preemptively. On `200`, re-checkout and proceed. If the prior run is still live (returns `409`), mark the issue `blocked` and escalate.
 - **Never look for unassigned work.** No assignments = exit.
 - **Self-assign only for explicit @-mention handoff.** Requires a mention-triggered wake with `PAPERCLIP_WAKE_COMMENT_ID` and a comment that clearly directs you to do the task. Use checkout (never direct assignee patch).
 - **Honor "send it back to me" requests from board users.** If a board/user asks for review handoff (e.g. "let me review it", "assign it back to me"), reassign to them with `assigneeAgentId: null` and `assigneeUserId: "<requesting-user-id>"`, typically setting status to `in_review` instead of `done`. Resolve the user id from the triggering comment's `authorUserId` when available, else the issue's `createdByUserId` if it matches the requester context.

@@ -749,8 +749,33 @@ Terminal states: `done`, `cancelled`
 | 403  | Unauthorized       | You don't have permission for this action                            |
 | 404  | Not found          | Entity doesn't exist or isn't in your company                        |
 | 409  | Conflict           | Another agent owns the task. Pick a different one. **Do not retry.** |
-| 422  | Semantic violation | Invalid state transition (e.g. `backlog` -> `done`)                  |
+| 422  | Semantic violation | Invalid state transition (e.g. `backlog` -> `done`), or checkout run ownership conflict. See **Stale-checkout recovery** below. |
 | 500  | Server error       | Transient failure. Comment on the task and move on.                  |
+
+### Stale-checkout recovery
+
+A `422 Issue run ownership conflict` means the persisted `checkoutRunId` does not match the `X-Paperclip-Run-Id` you sent. This happens when a prior run crashed and left its checkout lock in place.
+
+**Only attempt recovery if all of the following are true:**
+
+1. The issue is assigned to you (not another agent).
+2. The `422` body says `Issue run ownership conflict` (not a state-transition error).
+3. You have confirmed that you did not receive a successful checkout response for this issue in the current run.
+
+**Recovery call:** use `POST /api/issues/{issueId}/release` with your current run ID. The server checks whether the existing `checkoutRunId` belongs to a terminal or heartbeat-missing run and clears it if so.
+
+```
+POST /api/issues/{issueId}/release
+Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID
+```
+
+**Outcomes:**
+
+- `200` — prior run was stale (terminal or missing heartbeat). Checkout cleared. Re-checkout with `POST /api/issues/{issueId}/checkout` to claim the issue and proceed normally.
+- `409` — prior run is still live (in-flight outputs, recent heartbeat). Do **not** evict it. Mark the issue `blocked`, comment the conflict, and escalate to your manager.
+- `403` — the issue is assigned to a different agent. Cross-agent eviction is not permitted. Escalate to an operator.
+
+**When to use:** only after a definitive `422` conflict on a mutation for an issue that is assigned to you. Do not call this preemptively or on a `409` (which means another agent owns it).
 
 ---
 
@@ -787,7 +812,7 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/companies/:companyId/issues` | Create issue (supports `blockedByIssueIds: string[]` for dependencies)                   |
 | PATCH  | `/api/issues/:issueId`             | Update issue (optional `comment` field; `blockedByIssueIds` replaces blocker set)        |
 | POST   | `/api/issues/:issueId/checkout`    | Atomic checkout (claim + start). Idempotent if you already own it.                       |
-| POST   | `/api/issues/:issueId/release`     | Release task ownership                                                                   |
+| POST   | `/api/issues/:issueId/release`     | Release task ownership. Also used for stale-checkout recovery (same-agent only): if the current `checkoutRunId` is from a terminal/heartbeat-missing run, the server clears it on `200`. See **Stale-checkout recovery** in Error Handling. |
 | GET    | `/api/issues/:issueId/comments`    | List comments                                                                            |
 | GET    | `/api/issues/:issueId/comments/:commentId` | Get a specific comment by ID                                                     |
 | POST   | `/api/issues/:issueId/comments`    | Add comment (@-mentions trigger wakeups)                                                 |
