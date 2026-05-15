@@ -4487,6 +4487,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await tx
         .update(issues)
         .set({
+          checkoutRunId: null,
           executionRunId: queuedRun.id,
           executionAgentNameKey: normalizeAgentNameKey(agent.name),
           executionLockedAt: now,
@@ -4695,6 +4696,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await tx
           .update(issues)
           .set({
+            checkoutRunId: null,
             executionRunId: retryRun.id,
             executionAgentNameKey: normalizeAgentNameKey(agent.name),
             executionLockedAt: now,
@@ -5422,6 +5424,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await tx
           .update(issues)
           .set({
+            checkoutRunId: null,
             executionRunId: scheduledRun.id,
             executionAgentNameKey: normalizeAgentNameKey(agent.name),
             executionLockedAt: now,
@@ -8359,6 +8362,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await tx
           .update(issues)
           .set({
+            checkoutRunId: null,
             executionRunId: newRun.id,
             executionAgentNameKey: normalizeAgentNameKey(deferredAgent.name),
             executionLockedAt: now,
@@ -8490,6 +8494,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       await tx
         .update(issues)
         .set({
+          checkoutRunId: null,
           executionRunId: queuedRun.id,
           executionAgentNameKey: recoveryAgentNameKey,
           executionLockedAt: now,
@@ -8904,6 +8909,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               await tx
                 .update(issues)
                 .set({
+                  // Clear stale checkout if this legacy run is not yet running so the
+                  // new run can re-checkout cleanly via adoptUnownedCheckoutRun.
+                  ...(legacyRun.status !== 'running' ? { checkoutRunId: null } : {}),
                   executionRunId: legacyRun.id,
                   executionAgentNameKey: normalizeAgentNameKey(legacyAgent?.name),
                   executionLockedAt: new Date(),
