@@ -331,6 +331,7 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);
+export const HEARTBEAT_RUN_STALE_RECOVERY_THRESHOLD_MS = 60 * 60 * 1000;
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
 
@@ -3259,14 +3260,29 @@ export function issueService(db: Db) {
     );
   }
 
-  async function isTerminalOrMissingHeartbeatRun(runId: string) {
+  async function isTerminalOrMissingHeartbeatRun(runId: string, now: Date = new Date()) {
     const run = await db
-      .select({ status: heartbeatRuns.status })
+      .select({
+        status: heartbeatRuns.status,
+        lastOutputAt: heartbeatRuns.lastOutputAt,
+        processStartedAt: heartbeatRuns.processStartedAt,
+        startedAt: heartbeatRuns.startedAt,
+        createdAt: heartbeatRuns.createdAt,
+        updatedAt: heartbeatRuns.updatedAt,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     if (!run) return true;
-    return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return true;
+    const lastSignal =
+      run.lastOutputAt ??
+      run.updatedAt ??
+      run.processStartedAt ??
+      run.startedAt ??
+      run.createdAt;
+    if (!lastSignal) return false;
+    return now.getTime() - lastSignal.getTime() >= HEARTBEAT_RUN_STALE_RECOVERY_THRESHOLD_MS;
   }
 
   async function adoptStaleCheckoutRun(input: {
