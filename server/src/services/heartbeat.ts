@@ -6706,6 +6706,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.reconcileStrandedAssignedIssues();
   }
 
+  async function reconcileSourceScopedRecoveryActions() {
+    return recovery.reconcileSourceScopedRecoveryActions();
+  }
+
   function issueIdFromRunContext(contextSnapshot: unknown) {
     const context = parseObject(contextSnapshot);
     return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -9860,6 +9864,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     },
 
     reconcileStrandedAssignedIssues,
+    reconcileSourceScopedRecoveryActions,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 

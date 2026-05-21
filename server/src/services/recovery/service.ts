@@ -6,6 +6,7 @@ import {
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueRecoveryActionOutcome,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -70,6 +71,14 @@ const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+
+// Bound how many times automatic stranded-issue recovery retries before it
+// escalates to an explicit, agent-owned "Recover stalled issue" task.
+export const DEFAULT_MAX_STRANDED_RECOVERY_ATTEMPTS = 3;
+// A source-scoped recovery action that has stayed `active` and unresolved for
+// longer than this also escalates, even when it never accrued retry attempts
+// (e.g. a stranded issue that was blocked once and then never reconciled).
+export const STRANDED_RECOVERY_STALE_ESCALATION_MS = 6 * 60 * 60 * 1000;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
   "codex_local",
@@ -2025,7 +2034,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           reason: "no_invokable_recovery_owner",
         },
       monitorPolicy: null,
-      maxAttempts: null,
+      maxAttempts: DEFAULT_MAX_STRANDED_RECOVERY_ATTEMPTS,
       lastAttemptAt: now,
     });
 
@@ -2336,6 +2345,241 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     return updated;
+  }
+
+  function readEvidencePreviousStatus(
+    evidence: Record<string, unknown> | null | undefined,
+  ): "todo" | "in_progress" {
+    return parseObject(evidence)?.previousStatus === "todo" ? "todo" : "in_progress";
+  }
+
+  function strandedRecoveryCauseFromAction(
+    action: typeof issueRecoveryActions.$inferSelect,
+  ): StrandedRecoveryCause {
+    return action.cause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+      ? SUCCESSFUL_RUN_MISSING_STATE_REASON
+      : "stranded_assigned_issue";
+  }
+
+  // Decide whether a source-scoped recovery action should auto-resolve because
+  // its source issue (or, for escalated actions, its recovery task) reached a
+  // valid disposition. Returns null when the action should stay open.
+  async function classifySourceScopedRecoveryResolution(
+    action: typeof issueRecoveryActions.$inferSelect,
+    sourceIssue: typeof issues.$inferSelect,
+  ): Promise<{ outcome: IssueRecoveryActionOutcome; note: string } | null> {
+    if (sourceIssue.status === "done" || sourceIssue.status === "cancelled") {
+      return {
+        outcome: "restored",
+        note: `Source issue reached terminal status \`${sourceIssue.status}\`; recovery action auto-resolved.`,
+      };
+    }
+
+    if (action.status === "escalated") {
+      // An escalated action only resolves once its agent-owned recovery task
+      // completes — not merely because the source issue is now blocked by it.
+      if (!action.recoveryIssueId) return null;
+      const [recoveryIssue] = await db
+        .select({ status: issues.status, identifier: issues.identifier })
+        .from(issues)
+        .where(and(eq(issues.id, action.recoveryIssueId), eq(issues.companyId, action.companyId)))
+        .limit(1);
+      if (
+        recoveryIssue &&
+        (recoveryIssue.status === "done" || recoveryIssue.status === "cancelled")
+      ) {
+        return {
+          outcome: "restored",
+          note: `Recovery task ${recoveryIssue.identifier ?? action.recoveryIssueId} reached \`${recoveryIssue.status}\`; recovery action auto-resolved.`,
+        };
+      }
+      return null;
+    }
+
+    if (sourceIssue.status === "in_review") {
+      return {
+        outcome: "restored",
+        note: "Source issue moved to `in_review`; recovery action auto-resolved.",
+      };
+    }
+
+    if (sourceIssue.status === "blocked") {
+      const blockerIds = await existingUnresolvedBlockerIssueIds(
+        sourceIssue.companyId,
+        sourceIssue.id,
+      );
+      if (blockerIds.length > 0) {
+        return {
+          outcome: "blocked",
+          note: "Source issue is blocked by an unresolved first-class blocker; recovery action auto-resolved.",
+        };
+      }
+      return null;
+    }
+
+    if (
+      (sourceIssue.status === "todo" || sourceIssue.status === "in_progress") &&
+      (await hasActiveExecutionPath(sourceIssue.companyId, sourceIssue.id))
+    ) {
+      return {
+        outcome: "restored",
+        note: "Source issue has a live execution path again; recovery action auto-resolved.",
+      };
+    }
+
+    return null;
+  }
+
+  // Escalate an exhausted/stale stranded recovery action to an explicit,
+  // agent-owned "Recover stalled issue" task and mark the action `escalated`.
+  async function escalateExhaustedStrandedRecoveryAction(input: {
+    action: typeof issueRecoveryActions.$inferSelect;
+    sourceIssue: typeof issues.$inferSelect;
+  }): Promise<{ recoveryIssueId: string } | null> {
+    const { action, sourceIssue } = input;
+    if (isStrandedIssueRecoveryIssue(sourceIssue)) return null;
+
+    const recoveryCause = strandedRecoveryCauseFromAction(action);
+    const latestRun = await getLatestIssueRun(sourceIssue.companyId, sourceIssue.id);
+    const recoveryIssue = await ensureStrandedIssueRecoveryIssue({
+      issue: sourceIssue,
+      latestRun,
+      previousStatus: readEvidencePreviousStatus(action.evidence),
+      recoveryCause,
+    });
+    // No invokable recovery owner with budget — leave the action `active` so a
+    // later sweep retries once an owner becomes available. This is a genuine
+    // blocker, not an escalation failure to paper over.
+    if (!recoveryIssue) return null;
+
+    const escalated = await recoveryActionsSvc.escalateActiveForIssue({
+      companyId: action.companyId,
+      sourceIssueId: action.sourceIssueId,
+      actionId: action.id,
+      recoveryIssueId: recoveryIssue.id,
+      resolutionNote:
+        `Exhausted bounded automatic recovery after ${action.attemptCount} attempt(s); ` +
+        `escalated to agent-owned recovery task ${recoveryIssue.identifier ?? recoveryIssue.id}.`,
+    });
+    if (!escalated) return null;
+
+    // Make the source issue legitimately blocked by the recovery task so it
+    // resumes automatically once recovery completes.
+    const blockerIds = await existingUnresolvedBlockerIssueIds(
+      sourceIssue.companyId,
+      sourceIssue.id,
+    );
+    const nextBlockerIds = [...new Set([...blockerIds, recoveryIssue.id])];
+    await issuesSvc.update(sourceIssue.id, {
+      status: "blocked",
+      blockedByIssueIds: nextBlockerIds,
+    });
+
+    const prefix = await getCompanyIssuePrefix(sourceIssue.companyId);
+    await issuesSvc.addComment(
+      sourceIssue.id,
+      [
+        "Paperclip exhausted bounded automatic recovery for this issue and escalated it to an agent-owned recovery task.",
+        "",
+        `- Recovery action: \`${action.id}\``,
+        `- Recovery task: ${issueUiLink({ identifier: recoveryIssue.identifier, id: recoveryIssue.id }, prefix)}`,
+        `- Attempts: ${action.attemptCount} of ${action.maxAttempts ?? DEFAULT_MAX_STRANDED_RECOVERY_ATTEMPTS}`,
+        "- This issue is now blocked by the recovery task and resumes automatically once that task is done.",
+      ].join("\n"),
+      {},
+      { authorType: "system" },
+    );
+
+    await logActivity(db, {
+      companyId: sourceIssue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.recovery_action_escalated",
+      entityType: "issue",
+      entityId: sourceIssue.id,
+      details: {
+        identifier: sourceIssue.identifier,
+        source: "recovery.reconcile_source_scoped_recovery_actions",
+        recoveryActionId: action.id,
+        recoveryIssueId: recoveryIssue.id,
+        recoveryIssueIdentifier: recoveryIssue.identifier,
+        attemptCount: action.attemptCount,
+        maxAttempts: action.maxAttempts ?? DEFAULT_MAX_STRANDED_RECOVERY_ATTEMPTS,
+        recoveryCause,
+      },
+    });
+
+    return { recoveryIssueId: recoveryIssue.id };
+  }
+
+  // Lifecycle reconciliation for source-scoped stranded recovery actions:
+  // auto-resolve actions whose issue reached a valid disposition, and escalate
+  // actions whose retries are exhausted or that have stayed stale.
+  async function reconcileSourceScopedRecoveryActions() {
+    const result = {
+      recoveryActionsResolved: 0,
+      recoveryActionsEscalated: 0,
+      recoveryActionsSkipped: 0,
+      recoveryActionIssueIds: [] as string[],
+    };
+
+    const actions = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.status, ["active", "escalated"]),
+          inArray(issueRecoveryActions.kind, ["stranded_assigned_issue", "missing_disposition"]),
+        ),
+      );
+
+    for (const action of actions) {
+      const [sourceIssue] = await db
+        .select()
+        .from(issues)
+        .where(and(eq(issues.id, action.sourceIssueId), eq(issues.companyId, action.companyId)))
+        .limit(1);
+      if (!sourceIssue) {
+        result.recoveryActionsSkipped += 1;
+        continue;
+      }
+
+      const resolution = await classifySourceScopedRecoveryResolution(action, sourceIssue);
+      if (resolution) {
+        await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: action.companyId,
+          sourceIssueId: action.sourceIssueId,
+          actionId: action.id,
+          status: "resolved",
+          outcome: resolution.outcome,
+          resolutionNote: resolution.note,
+        });
+        result.recoveryActionsResolved += 1;
+        continue;
+      }
+
+      if (action.status === "active") {
+        const cap = action.maxAttempts ?? DEFAULT_MAX_STRANDED_RECOVERY_ATTEMPTS;
+        const lastAttemptAt = action.lastAttemptAt ?? action.updatedAt ?? action.createdAt;
+        const ageMs = Date.now() - new Date(lastAttemptAt).getTime();
+        const shouldEscalate =
+          action.attemptCount >= cap || ageMs >= STRANDED_RECOVERY_STALE_ESCALATION_MS;
+        if (shouldEscalate) {
+          const escalated = await escalateExhaustedStrandedRecoveryAction({ action, sourceIssue });
+          if (escalated) {
+            result.recoveryActionsEscalated += 1;
+            result.recoveryActionIssueIds.push(escalated.recoveryIssueId);
+            continue;
+          }
+        }
+      }
+
+      result.recoveryActionsSkipped += 1;
+    }
+
+    return result;
   }
 
   async function reconcileStrandedAssignedIssues() {
@@ -3450,6 +3694,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recordWatchdogDecision,
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
+    reconcileSourceScopedRecoveryActions,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,

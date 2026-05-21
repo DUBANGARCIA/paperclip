@@ -324,6 +324,114 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("caps stranded recovery retries, escalates to an agent-owned recovery task, and auto-resolves once that task completes", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    // Three automatic recovery attempts exhausts the default cap.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await recovery.escalateStrandedAssignedIssue({
+        issue: sourceIssue,
+        previousStatus: "in_progress",
+        latestRun,
+        comment: "Automatic continuation recovery failed.",
+      });
+    }
+
+    const [beforeAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(beforeAction).toMatchObject({ status: "active", attemptCount: 3, maxAttempts: 3 });
+    expect(beforeAction?.recoveryIssueId).toBeNull();
+
+    const escalation = await recovery.reconcileSourceScopedRecoveryActions();
+    expect(escalation.recoveryActionsEscalated).toBe(1);
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
+    expect(recoveryIssues).toHaveLength(1);
+    expect(recoveryIssues[0]?.title).toContain("Recover stalled issue");
+    expect(recoveryIssues[0]?.assigneeAgentId).toBe(managerId);
+
+    const [escalatedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(escalatedAction).toMatchObject({ status: "escalated" });
+    expect(escalatedAction?.recoveryIssueId).toBe(recoveryIssues[0]?.id);
+
+    // The source issue is now legitimately blocked by the recovery task.
+    const blockerRelations = await db
+      .select()
+      .from(issueRelations)
+      .where(
+        and(eq(issueRelations.relatedIssueId, sourceIssue.id), eq(issueRelations.type, "blocks")),
+      );
+    expect(blockerRelations.map((row) => row.issueId)).toContain(recoveryIssues[0]?.id);
+
+    // Completing the recovery task auto-resolves the escalated action.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, recoveryIssues[0]!.id));
+    const resolution = await recovery.reconcileSourceScopedRecoveryActions();
+    expect(resolution.recoveryActionsResolved).toBe(1);
+
+    const [resolvedAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(resolvedAction).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(await recovery.reconcileSourceScopedRecoveryActions()).toMatchObject({
+      recoveryActionsResolved: 0,
+      recoveryActionsEscalated: 0,
+    });
+  });
+
+  it("auto-resolves a source-scoped recovery action once the source issue reaches a terminal disposition", async () => {
+    const { coderId, sourceIssue } = await seedCompany();
+    const enqueueWakeup = vi.fn(async () => null);
+    const recovery = recoveryService(db, { enqueueWakeup });
+    const latestRun = {
+      id: randomUUID(),
+      agentId: coderId,
+      status: "failed",
+      error: "adapter failed",
+      errorCode: "adapter_failed",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+    } as const;
+
+    await recovery.escalateStrandedAssignedIssue({
+      issue: sourceIssue,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssue.id));
+
+    const result = await recovery.reconcileSourceScopedRecoveryActions();
+    expect(result.recoveryActionsResolved).toBe(1);
+    expect(result.recoveryActionsEscalated).toBe(0);
+
+    const [action] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(action).toMatchObject({ status: "resolved", outcome: "restored" });
+  });
+
   it("reuses the same source-scoped action when latest run IDs change while the cause stays the same", async () => {
     const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
     const enqueueWakeup = vi.fn(async () => null);

@@ -739,6 +739,12 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
         }
       })
+      .then(async () => {
+        const reconciled = await heartbeat.reconcileSourceScopedRecoveryActions();
+        if (reconciled.recoveryActionsResolved > 0 || reconciled.recoveryActionsEscalated > 0) {
+          logger.warn({ ...reconciled }, "startup recovery-action lifecycle reconciliation changed recovery actions");
+        }
+      })
       .catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
       });
@@ -803,6 +809,12 @@ export async function startServer(): Promise<StartedServer> {
           const reviewed = await heartbeat.reconcileProductivityReviews();
           if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
             logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+          }
+        })
+        .then(async () => {
+          const reconciled = await heartbeat.reconcileSourceScopedRecoveryActions();
+          if (reconciled.recoveryActionsResolved > 0 || reconciled.recoveryActionsEscalated > 0) {
+            logger.warn({ ...reconciled }, "periodic recovery-action lifecycle reconciliation changed recovery actions");
           }
         })
         .catch((err) => {
