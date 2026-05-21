@@ -46,6 +46,14 @@ export type ResolveIssueRecoveryActionInput = {
   resolutionNote?: string | null;
 };
 
+export type EscalateIssueRecoveryActionInput = {
+  companyId: string;
+  sourceIssueId: string;
+  actionId?: string | null;
+  recoveryIssueId: string;
+  resolutionNote?: string | null;
+};
+
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {
   return {
     id: row.id,
@@ -182,9 +190,13 @@ export function issueRecoveryActionService(db: Db) {
       const [updated] = await db
         .update(issueRecoveryActions)
         .set({
-          recoveryIssueId: input.recoveryIssueId ?? null,
+          // Preserve an existing escalation link/cap: a re-upsert of the same
+          // recovery action must not drop the recovery issue or retry budget.
+          recoveryIssueId: input.recoveryIssueId ?? existing.recoveryIssueId,
           kind: input.kind,
-          status: "active",
+          // A re-stranded issue must not silently de-escalate an action that
+          // already escalated to an agent-owned recovery task.
+          status: existing.status === "escalated" ? "escalated" : "active",
           ownerType,
           ownerAgentId: input.ownerAgentId ?? null,
           ownerUserId: input.ownerUserId ?? null,
@@ -197,7 +209,7 @@ export function issueRecoveryActionService(db: Db) {
           wakePolicy: input.wakePolicy ?? null,
           monitorPolicy: input.monitorPolicy ?? null,
           attemptCount: existing.attemptCount + 1,
-          maxAttempts: input.maxAttempts ?? null,
+          maxAttempts: input.maxAttempts ?? existing.maxAttempts,
           timeoutAt: input.timeoutAt ?? null,
           lastAttemptAt: input.lastAttemptAt ?? now,
           outcome: null,
@@ -286,10 +298,39 @@ export function issueRecoveryActionService(db: Db) {
     return updated ? toReadModel(updated) : null;
   }
 
+  async function escalateActiveForIssue(
+    input: EscalateIssueRecoveryActionInput,
+    dbOrTx: DbOrTransaction = db,
+  ): Promise<IssueRecoveryAction | null> {
+    const now = new Date();
+    const predicates = [
+      eq(issueRecoveryActions.companyId, input.companyId),
+      eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
+      eq(issueRecoveryActions.status, "active"),
+    ];
+    if (input.actionId) {
+      predicates.push(eq(issueRecoveryActions.id, input.actionId));
+    }
+
+    const [updated] = await dbOrTx
+      .update(issueRecoveryActions)
+      .set({
+        status: "escalated",
+        recoveryIssueId: input.recoveryIssueId,
+        resolutionNote: input.resolutionNote ?? null,
+        updatedAt: now,
+      })
+      .where(and(...predicates))
+      .returning();
+
+    return updated ? toReadModel(updated) : null;
+  }
+
   return {
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
+    escalateActiveForIssue,
     upsertSourceScoped,
   };
 }

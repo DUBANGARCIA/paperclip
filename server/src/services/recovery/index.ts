@@ -30,6 +30,8 @@ export type {
 } from "./issue-graph-liveness.js";
 export {
   recoveryService,
+  DEFAULT_MAX_STRANDED_RECOVERY_ATTEMPTS,
+  STRANDED_RECOVERY_STALE_ESCALATION_MS,
 } from "./service.js";
 export {
   DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS,
