@@ -129,11 +129,27 @@ jobs:
       - name: Run grouped general test suites
         run: pnpm test:run:general -- --group '${{ matrix.group }}'
 
+  security:
+    name: Security scan (Trivy)
+    needs: [policy]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup mise
+        uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac
+
+      - name: Security scan (Trivy)
+        run: mise exec -- trivy fs --exit-code 1 --severity CRITICAL,HIGH .
+
   verify:
     # Preserve the legacy required-check name while the underlying work runs in parallel.
     name: verify
     if: ${{ always() }}
-    needs: [typecheck_release_registry, general_tests, build]
+    needs: [typecheck_release_registry, general_tests, build, security]
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -143,10 +159,12 @@ jobs:
           TYPECHECK_RELEASE_REGISTRY_RESULT: ${{ needs.typecheck_release_registry.result }}
           GENERAL_TESTS_RESULT: ${{ needs.general_tests.result }}
           BUILD_RESULT: ${{ needs.build.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
         run: |
           test "$TYPECHECK_RELEASE_REGISTRY_RESULT" = "success"
           test "$GENERAL_TESTS_RESULT" = "success"
           test "$BUILD_RESULT" = "success"
+          test "$SECURITY_RESULT" = "success"
 
   build:
     name: Build
